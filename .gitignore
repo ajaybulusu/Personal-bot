@@ -1,0 +1,8 @@
+*.log
+bot_heartbeat
+bot_state.json
+bot.pid
+email_cache.json
+calendar_cache.json
+__pycache__/
+*.pyc
