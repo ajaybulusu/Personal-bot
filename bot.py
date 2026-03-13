@@ -1,29 +1,29 @@
 """
-Executive Assistant Telegram Bot — v4 STABLE
-=============================================
-Key fixes in v4:
-  - Serial message queue (no parallel threads hitting OpenAI)
-  - Single GPT call per message (was 3 calls before = rate limit hell)
-  - Rate limit backoff: waits 25s and retries on 429
-  - Robust curl polling with retry on network errors
-  - Heartbeat updated every poll cycle
-  - Zero Manus credits per query
+Executive Assistant Telegram Bot — v5
+======================================
+Architecture:
+  - Runs 24/7 on Railway cloud
+  - Handles all Telegram messages, voice notes, calendar queries
+  - Email cache is pushed daily by Manus scheduled task (8am SGT)
+  - Exposes /sync endpoint so Manus can push fresh email data
 """
 
 import os, sys, json, time, logging, threading, traceback, queue, tempfile
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Google Calendar direct API
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gcal_build
+import base64
 
 import subprocess
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from openai import OpenAI
 
-# ── Config — loaded from environment variables (set in Railway dashboard) ────
+# ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 CHAT_ID      = os.environ.get("CHAT_ID", "")
 OPENAI_KEYS  = [
@@ -34,31 +34,31 @@ OPENAI_KEYS  = [
 ]
 if not OPENAI_KEYS:
     raise RuntimeError("No OpenAI keys set — check OPENAI_KEY_PRIMARY env var")
-OPENAI_KEY   = OPENAI_KEYS[0]
 OPENAI_MODEL = "gpt-4o-mini"
+SYNC_SECRET  = os.environ.get("SYNC_SECRET", "ajay-bot-sync-2026")
 
-BASE_DIR         = Path(__file__).parent
-EMAIL_CACHE      = BASE_DIR / "email_cache.json"
-CALENDAR_CACHE   = BASE_DIR / "calendar_cache.json"
-STATE_FILE       = BASE_DIR / "bot_state.json"
-LOG_FILE         = BASE_DIR / "bot.log"
-SA_FILE          = BASE_DIR / "service_account.json"
-HEARTBEAT_FILE   = BASE_DIR / "bot_heartbeat"
-GCAL_ID          = os.environ.get("GCAL_ID", "bulusu.ajay@gmail.com")
+BASE_DIR       = Path(__file__).parent
+EMAIL_CACHE    = BASE_DIR / "email_cache.json"
+CALENDAR_CACHE = BASE_DIR / "calendar_cache.json"
+STATE_FILE     = BASE_DIR / "bot_state.json"
+LOG_FILE       = BASE_DIR / "bot.log"
+SA_FILE        = BASE_DIR / "service_account.json"
+HEARTBEAT_FILE = BASE_DIR / "bot_heartbeat"
+GCAL_ID        = os.environ.get("GCAL_ID", "bulusu.ajay@gmail.com")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# On Railway, write service_account.json from env var if not present
+# Write service_account.json from env var on Railway
 _sa_env = os.environ.get("SERVICE_ACCOUNT_JSON", "")
 if _sa_env and not SA_FILE.exists():
     SA_FILE.write_text(_sa_env)
 
-# Create empty caches on first boot (Railway has no persistent files)
+# Create empty caches on first boot
 for _cache in [EMAIL_CACHE, CALENDAR_CACHE]:
     if not _cache.exists():
         _cache.write_text("[]")
 
-# ── Logging ─────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -69,8 +69,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── OpenAI client — ALWAYS direct to api.openai.com ─────────────────────────
-# Dual-key setup: primary + backup with automatic failover
+# ── OpenAI — dual-key failover ────────────────────────────────────────────────
 _active_key_idx = 0
 
 def _get_ai_client(key_idx=None):
@@ -80,10 +79,10 @@ def _get_ai_client(key_idx=None):
 
 ai = _get_ai_client(0)
 
-# ── Serial message queue — prevents parallel OpenAI calls ───────────────────
+# ── Serial message queue ──────────────────────────────────────────────────────
 msg_queue = queue.Queue()
 
-# ── State ────────────────────────────────────────────────────────────────────
+# ── State ─────────────────────────────────────────────────────────────────────
 def load_state():
     try:
         return json.loads(STATE_FILE.read_text())
@@ -96,113 +95,74 @@ def save_state(s):
 def touch_heartbeat():
     HEARTBEAT_FILE.write_text(str(time.time()))
 
-# ── Telegram via curl (SSL-reliable) ─────────────────────────────────────────
+# ── Telegram via curl ─────────────────────────────────────────────────────────
 def _curl_tg(endpoint, data=None, params=None, timeout=15):
     url = f"{TG_API}/{endpoint}"
+    cmd = ["curl", "-s", "--max-time", str(timeout), "-X", "POST", url]
+    if data:
+        cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(data)]
     if params:
         qs = "&".join(f"{k}={v}" for k, v in params.items())
         url = f"{url}?{qs}"
-    cmd = ["curl", "-s", "--max-time", str(timeout), "-X"]
-    if data:
-        cmd += ["POST", url, "-H", "Content-Type: application/json", "-d", json.dumps(data)]
-    else:
-        cmd += ["GET", url]
-    for attempt in range(5):
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
-            if result.returncode == 0 and result.stdout.strip():
-                return json.loads(result.stdout)
-        except Exception as e:
-            log.warning(f"curl attempt {attempt+1} failed: {e}")
-        time.sleep(2 * (attempt + 1))
-    return None
+        cmd = ["curl", "-s", "--max-time", str(timeout), url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+        return json.loads(result.stdout) if result.stdout else {}
+    except Exception as e:
+        log.warning(f"curl_tg error: {e}")
+        return {}
 
-def tg_send(text, parse_mode="Markdown"):
-    MAX = 4000
-    for chunk in [text[i:i+MAX] for i in range(0, max(len(text), 1), MAX)]:
-        r = _curl_tg("sendMessage", data={
-            "chat_id": CHAT_ID, "text": chunk, "parse_mode": parse_mode
-        })
-        if r and not r.get("ok"):
-            _curl_tg("sendMessage", data={"chat_id": CHAT_ID, "text": chunk})
-        time.sleep(0.3)
+def tg_send(text: str):
+    _curl_tg("sendMessage", data={
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown"
+    })
 
 def tg_typing():
-    try:
-        _curl_tg("sendChatAction", data={"chat_id": CHAT_ID, "action": "typing"}, timeout=5)
-    except:
-        pass
+    _curl_tg("sendChatAction", data={"chat_id": CHAT_ID, "action": "typing"})
 
-def tg_get_updates(offset, timeout=8):
-    touch_heartbeat()
-    r = _curl_tg("getUpdates", params={
-        "offset": offset, "timeout": timeout, "allowed_updates": "message"
-    }, timeout=timeout + 7)
-    touch_heartbeat()
-    if r and r.get("ok"):
-        return r.get("result", [])
+def tg_get_updates(offset: int, timeout: int = 25):
+    cmd = [
+        "curl", "-s", "--max-time", str(timeout + 5),
+        f"{TG_API}/getUpdates?offset={offset}&timeout={timeout}&allowed_updates=[\"message\"]"
+    ]
+    for attempt in range(3):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
+            data = json.loads(result.stdout)
+            if data.get("ok"):
+                return data.get("result", [])
+        except Exception as e:
+            log.warning(f"getUpdates attempt {attempt+1} error: {e}")
+            time.sleep(2)
     return []
 
-def tg_get_file(file_id: str) -> str | None:
-    """Get the file path on Telegram servers for a given file_id."""
-    r = _curl_tg("getFile", params={"file_id": file_id})
-    if r and r.get("ok"):
-        return r["result"].get("file_path")
-    return None
-
-def tg_download_file(file_path: str, dest: str) -> bool:
-    """Download a file from Telegram to a local path using curl."""
-    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-    cmd = ["curl", "-s", "--max-time", "30", "-o", dest, url]
-    try:
-        result = subprocess.run(cmd, capture_output=True, timeout=35)
-        return result.returncode == 0
-    except Exception as e:
-        log.warning(f"tg_download_file error: {e}")
-        return False
-
+# ── Voice transcription ───────────────────────────────────────────────────────
 def transcribe_voice(file_id: str) -> str | None:
-    """Download a Telegram voice/audio file and transcribe with Whisper."""
     try:
-        file_path = tg_get_file(file_id)
+        info = _curl_tg("getFile", data={"file_id": file_id})
+        file_path = info.get("result", {}).get("file_path", "")
         if not file_path:
-            log.warning("transcribe_voice: could not get file path")
             return None
-
-        ext = ".ogg"
-        if file_path.endswith(".mp3"):
-            ext = ".mp3"
-        elif file_path.endswith(".m4a"):
-            ext = ".m4a"
-
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp_path = tmp.name
-
-        ok = tg_download_file(file_path, tmp_path)
-        if not ok:
-            log.warning("transcribe_voice: download failed")
-            return None
-
-        with open(tmp_path, "rb") as audio_file:
-            whisper_client = _get_ai_client(_active_key_idx)
+        download_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+        tmp_path = tempfile.mktemp(suffix=".ogg")
+        subprocess.run(["curl", "-s", "-o", tmp_path, download_url], timeout=30)
+        whisper_client = OpenAI(api_key=OPENAI_KEYS[_active_key_idx], base_url="https://api.openai.com/v1")
+        with open(tmp_path, "rb") as f:
             transcript = whisper_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="text"
+                model="whisper-1", file=f, response_format="text"
             )
-        os.unlink(tmp_path)
-        text = transcript.strip() if isinstance(transcript, str) else transcript
-        log.info(f"Voice transcribed: {str(text)[:100]}")
-        return str(text)
-    except Exception as e:
-        log.error(f"transcribe_voice error: {e}")
         try:
             os.unlink(tmp_path)
         except:
             pass
+        return str(transcript)
+    except Exception as e:
+        log.error(f"transcribe_voice error: {e}")
         return None
 
-# ── Google Calendar ──────────────────────────────────────────────────────────
+# ── Google Calendar ───────────────────────────────────────────────────────────
 def get_gcal_service():
     creds = service_account.Credentials.from_service_account_file(
         str(SA_FILE),
@@ -268,9 +228,8 @@ def gcal_list_upcoming(days=60) -> list:
         except:
             return []
 
-# ── Data loaders ─────────────────────────────────────────────────────────────
+# ── Data loaders ──────────────────────────────────────────────────────────────
 def load_emails(days=7) -> list:
-    """Load emails from the past N days only (default 7 days)."""
     try:
         data = json.loads(EMAIL_CACHE.read_text())
         emails = data if isinstance(data, list) else list(data.values())
@@ -280,7 +239,6 @@ def load_emails(days=7) -> list:
             try:
                 date_str = e.get("date", "")
                 if date_str:
-                    # Try parsing various date formats
                     from email.utils import parsedate_to_datetime
                     dt = parsedate_to_datetime(date_str)
                     if dt.tzinfo is None:
@@ -288,9 +246,9 @@ def load_emails(days=7) -> list:
                     if dt >= cutoff:
                         filtered.append(e)
                 else:
-                    filtered.append(e)  # keep if no date
+                    filtered.append(e)
             except:
-                filtered.append(e)  # keep if date unparseable
+                filtered.append(e)
         log.info(f"Email filter: {len(filtered)}/{len(emails)} emails in past {days} days")
         return filtered
     except:
@@ -302,7 +260,7 @@ def load_calendar() -> list:
     except:
         return []
 
-# ── OpenAI — dual-key failover, rate limit retry ────────────────────────────
+# ── OpenAI — dual-key failover, rate limit retry ──────────────────────────────
 def gpt(system: str, user: str, max_tokens=900) -> str:
     global _active_key_idx, ai
     for attempt in range(6):
@@ -320,12 +278,11 @@ def gpt(system: str, user: str, max_tokens=900) -> str:
         except Exception as e:
             err = str(e)
             if "429" in err or "rate_limit" in err.lower():
-                # Switch to the other key immediately
                 other_idx = 1 - _active_key_idx
-                log.warning(f"Key {_active_key_idx} rate-limited — switching to key {other_idx} (attempt {attempt+1})")
+                log.warning(f"Key {_active_key_idx} rate-limited — switching to key {other_idx}")
                 _active_key_idx = other_idx
                 ai = _get_ai_client(_active_key_idx)
-                time.sleep(3)  # brief pause before retry with new key
+                time.sleep(3)
             elif "401" in err or "invalid" in err.lower() or "incorrect" in err.lower():
                 log.error(f"Key {_active_key_idx} auth error — switching to other key")
                 _active_key_idx = 1 - _active_key_idx
@@ -360,9 +317,7 @@ Flag urgent/overdue items with ⚠️. Extract specific amounts, dates, policy n
 {emails}"""
 
 def score_emails(question: str, emails: list, top_n=15) -> list:
-    """Fast keyword scoring — no extra GPT call needed."""
     keywords = question.lower().split()
-    # Add domain-specific expansions
     kw_map = {
         "flight": ["sq", "ek", "tr", "ai ", "airline", "booking", "pnr", "e-ticket"],
         "insurance": ["premium", "policy", "absli", "max life", "icici pru", "care health", "nach"],
@@ -419,7 +374,6 @@ def format_emails(emails: list) -> str:
     return "\n\n---\n\n".join(parts)
 
 def handle_message(text: str):
-    """Process a message and reply. Called serially from the queue worker."""
     try:
         tg_typing()
         t = text.strip()
@@ -433,11 +387,10 @@ def handle_message(text: str):
             send_briefing()
             return
 
-        emails   = load_emails(days=7)  # only past 7 days
+        emails   = load_emails(days=7)
         calendar = load_calendar()
         today    = datetime.now(timezone(timedelta(hours=8))).strftime("%d %B %Y, %A")
 
-        # Filter calendar to next 14 days for Q&A context
         now_sgt = datetime.now(timezone(timedelta(hours=8)))
         cal_14d = []
         for ev in calendar:
@@ -452,18 +405,16 @@ def handle_message(text: str):
             except:
                 cal_14d.append(ev)
 
-        relevant = score_emails(t, emails)
+        relevant  = score_emails(t, emails)
         email_ctx = format_emails(relevant)
         cal_ctx   = format_calendar(cal_14d)
 
-        # Single GPT call handles both calendar intent AND Q&A
         response = gpt(
             MASTER_PROMPT.format(today=today, calendar=cal_ctx, emails=email_ctx),
             t,
             max_tokens=900
         )
 
-        # Check if GPT wants to create a calendar event
         if "<calendar>" in response and "</calendar>" in response:
             import re
             cal_json_str = re.search(r"<calendar>(.*?)</calendar>", response, re.DOTALL)
@@ -480,7 +431,7 @@ def handle_message(text: str):
                     description = cal_data.get("description") or ""
 
                     if date:
-                        event = gcal_create_event(summary, date, start_time, end_time, description, location)
+                        gcal_create_event(summary, date, start_time, end_time, description, location)
                         time_str = f" at {start_time}" if start_time else ""
                         end_str  = f"–{end_time}" if end_time else ""
                         loc_str  = f"\n📍 {location}" if location else ""
@@ -503,9 +454,8 @@ def handle_message(text: str):
         tg_send(f"⚠️ Error: {str(e)[:100]}")
 
 
-# ── Queue worker — processes messages one at a time ──────────────────────────
+# ── Queue worker ──────────────────────────────────────────────────────────────
 def queue_worker():
-    """Runs in a background thread, processes messages serially."""
     while True:
         try:
             text = msg_queue.get(timeout=60)
@@ -521,13 +471,12 @@ def queue_worker():
 
 # ── Morning briefing ──────────────────────────────────────────────────────────
 def send_briefing():
-    emails   = load_emails()
+    emails   = load_emails(days=7)
     calendar = gcal_list_upcoming(days=60)
     today    = datetime.now(timezone(timedelta(hours=8))).strftime("%A, %d %B %Y")
 
     tg_send(f"☀️ *Good morning, Ajay!*\nExecutive briefing for *{today}*\n")
 
-    # Calendar: this week
     now = datetime.now(timezone(timedelta(hours=8)))
     week_end = now + timedelta(days=7)
     week_events = []
@@ -552,7 +501,6 @@ def send_briefing():
             lines.append(f"• {e.get('summary','')}{loc_str} — _{fmt}_")
         tg_send("\n".join(lines))
 
-    # Upcoming flights
     month_end = now + timedelta(days=30)
     flight_events = []
     for e in calendar:
@@ -575,7 +523,6 @@ def send_briefing():
             lines.append(f"• {e.get('summary','')} — _{fmt}_")
         tg_send("\n".join(lines))
 
-    # Email categories
     categories = [
         ("🚨 *Urgent — Failed/Declined Payments*",
          ["failed", "declined", "bounce", "insufficient", "nach", "dishonour", "unsuccessful", "returned"]),
@@ -658,26 +605,79 @@ Just send a voice message — I'll transcribe and answer it!
 /help — This message"""
 
 
+# ── HTTP sync endpoint — receives email cache from Manus daily task ───────────
+class SyncHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # suppress default HTTP logs
+
+    def do_POST(self):
+        if self.path != "/sync":
+            self.send_response(404)
+            self.end_headers()
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length)
+            data = json.loads(body)
+
+            if data.get("secret") != SYNC_SECRET:
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b'{"error":"forbidden"}')
+                return
+
+            emails = data.get("emails", [])
+            EMAIL_CACHE.write_text(json.dumps(emails, indent=2))
+            log.info(f"Sync: received {len(emails)} emails from Manus")
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": True, "count": len(emails)}).encode())
+        except Exception as e:
+            log.error(f"Sync handler error: {e}")
+            self.send_response(500)
+            self.end_headers()
+
+    def do_GET(self):
+        # Health check endpoint
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        email_count = len(load_emails(days=30))
+        self.wfile.write(json.dumps({"status": "ok", "emails": email_count}).encode())
+
+
+def start_sync_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), SyncHandler)
+    log.info(f"Sync server listening on port {port}")
+    server.serve_forever()
+
+
 # ── Main polling loop ─────────────────────────────────────────────────────────
 def run():
     state  = load_state()
     offset = state.get("last_update_id", 0) + 1
 
-    email_count = len(load_emails())
+    email_count = len(load_emails(days=30))
     cal_count   = len(load_calendar())
-    log.info(f"Bot v4 starting. Emails: {email_count}, Calendar: {cal_count}, Offset: {offset}")
+    log.info(f"Bot v5 starting. Emails in cache: {email_count}, Calendar: {cal_count}, Offset: {offset}")
 
     # Start serial queue worker
     worker = threading.Thread(target=queue_worker, daemon=True)
     worker.start()
 
-    # Send startup message
+    # Start HTTP sync server (Railway requires a bound port)
+    sync_thread = threading.Thread(target=start_sync_server, daemon=True)
+    sync_thread.start()
+
     tg_send(
-        f"🤖 *Executive Assistant v4 is online!*\n\n"
-        f"✅ {email_count} emails loaded\n"
+        f"🤖 *Executive Assistant v5 is online!*\n\n"
+        f"✅ {email_count} emails in cache\n"
         f"✅ {cal_count} calendar events loaded\n"
-        f"✅ Direct OpenAI (zero Manus credits)\n"
-        f"✅ Serial queue (no rate limit crashes)\n\n"
+        f"✅ Direct OpenAI (dual-key failover)\n"
+        f"✅ 24/7 on Railway cloud\n\n"
         f"Ask me anything or type /help"
     )
 
@@ -703,12 +703,11 @@ def run():
                 if chat_id != CHAT_ID:
                     continue
 
-                # Handle voice messages (audio notes)
+                # Handle voice messages
                 voice = msg.get("voice") or msg.get("audio")
                 if voice and not text:
                     file_id = voice.get("file_id")
                     log.info(f"VOICE [{uid}]: file_id={file_id}")
-                    # Transcribe in a thread so polling isn't blocked
                     def _transcribe_and_queue(fid=file_id, uid=uid):
                         tg_send("🎙️ _Transcribing your voice note..._")
                         transcript = transcribe_voice(fid)
@@ -717,7 +716,7 @@ def run():
                             tg_send(f"🎙️ *You said:* _{transcript}_")
                             msg_queue.put(transcript)
                         else:
-                            tg_send("⚠️ Sorry, I couldn't transcribe that audio. Please try again or type your question.")
+                            tg_send("⚠️ Sorry, I couldn't transcribe that. Please try again or type your question.")
                     threading.Thread(target=_transcribe_and_queue, daemon=True).start()
                     continue
 
@@ -725,7 +724,7 @@ def run():
                     continue
 
                 log.info(f"MSG [{uid}]: {text[:80]}")
-                msg_queue.put(text)  # Queue it — worker processes serially
+                msg_queue.put(text)
 
         except KeyboardInterrupt:
             log.info("Bot stopped.")
