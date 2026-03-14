@@ -1,419 +1,338 @@
 """
-Executive Assistant Telegram Bot — v5 (Railway)
-================================================
-- Runs 24/7 on Railway
-- Handles all Telegram Q&A, voice notes, calendar queries
-- Morning briefing is sent by Manus scheduled task (8am SGT daily)
-- Simple health-check HTTP server on PORT so Railway stays happy
+Personal Assistant Telegram Bot
+================================
+Simple, reliable, async. Reads Gmail + Google Calendar, answers questions,
+adds calendar events, sends a daily 8am SGT briefing.
+
+Architecture:
+  - python-telegram-bot (async, no subprocess curl nonsense)
+  - Anthropic Claude API for AI responses
+  - Google APIs via OAuth service account (Calendar) + Gmail API
+  - APScheduler for daily briefing
+  - All state in memory — restarts cleanly with no stale file issues
 """
 
-import os, sys, json, time, logging, threading, traceback, queue, tempfile, re
+import os, re, json, logging, asyncio
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from base64 import urlsafe_b64decode
+from email import message_from_bytes
 
+import anthropic
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from telegram import Update
+from telegram.constants import ChatAction
+from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 from google.oauth2 import service_account
-from googleapiclient.discovery import build as gcal_build
-import base64, subprocess
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-from openai import OpenAI
-
-# ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-CHAT_ID     = os.environ.get("CHAT_ID", "")
-OPENAI_KEYS = [k for k in [
-    os.environ.get("OPENAI_KEY_PRIMARY", ""),
-    os.environ.get("OPENAI_KEY_BACKUP", ""),
-] if k]
-if not OPENAI_KEYS:
-    raise RuntimeError("No OpenAI keys set")
-OPENAI_MODEL = "gpt-4o-mini"
-
-BASE_DIR       = Path(__file__).parent
-CALENDAR_CACHE = BASE_DIR / "calendar_cache.json"
-STATE_FILE     = BASE_DIR / "bot_state.json"
-LOG_FILE       = BASE_DIR / "bot.log"
-SA_FILE        = BASE_DIR / "service_account.json"
-HEARTBEAT_FILE = BASE_DIR / "bot_heartbeat"
-GCAL_ID        = os.environ.get("GCAL_ID", "bulusu.ajay@gmail.com")
-
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-# Write service_account.json from env var on Railway
-_sa_env = os.environ.get("SERVICE_ACCOUNT_JSON", "")
-if _sa_env and not SA_FILE.exists():
-    SA_FILE.write_text(_sa_env)
-
-if not CALENDAR_CACHE.exists():
-    CALENDAR_CACHE.write_text("[]")
+from googleapiclient.discovery import build as google_build
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler(sys.stdout)]
+    format="%(asctime)s %(levelname)s %(name)s %(message)s"
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("bot")
 
-# ── OpenAI dual-key failover ──────────────────────────────────────────────────
-_key_idx = 0
+# ── Config from environment ───────────────────────────────────────────────────
+BOT_TOKEN        = os.environ["BOT_TOKEN"]
+CHAT_ID          = os.environ["CHAT_ID"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GCAL_ID          = os.environ.get("GCAL_ID", "primary")
+SA_JSON          = os.environ["SERVICE_ACCOUNT_JSON"]   # full JSON string
 
-def _ai():
-    return OpenAI(api_key=OPENAI_KEYS[_key_idx], base_url="https://api.openai.com/v1")
+SGT = timezone(timedelta(hours=8))
 
-# ── Serial message queue ──────────────────────────────────────────────────────
-msg_queue = queue.Queue()
+# ── Google credentials (from env var — no file writing needed) ────────────────
+import json as _json, tempfile, os as _os
 
-# ── State ─────────────────────────────────────────────────────────────────────
-def load_state():
-    try:    return json.loads(STATE_FILE.read_text())
-    except: return {"last_update_id": 0}
+def _get_google_creds(scopes):
+    sa_info = _json.loads(SA_JSON)
+    return service_account.Credentials.from_service_account_info(sa_info, scopes=scopes)
 
-def save_state(s):
-    STATE_FILE.write_text(json.dumps(s))
+def get_calendar_service():
+    creds = _get_google_creds(["https://www.googleapis.com/auth/calendar"])
+    return google_build("calendar", "v3", credentials=creds)
 
-def touch_heartbeat():
-    HEARTBEAT_FILE.write_text(str(time.time()))
+def get_gmail_service():
+    creds = _get_google_creds([
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://mail.google.com/"
+    ])
+    return google_build("gmail", "v1", credentials=creds)
 
-# ── Telegram ──────────────────────────────────────────────────────────────────
-def _curl(endpoint, data=None, params_str="", timeout=15):
-    url = f"{TG_API}/{endpoint}{params_str}"
-    cmd = ["curl", "-s", "--max-time", str(timeout), "-X", "POST", url]
-    if data:
-        cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(data)]
+# ── Calendar helpers ───────────────────────────────────────────────────────────
+def fetch_upcoming_events(days: int = 14) -> list:
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout+5)
-        return json.loads(r.stdout) if r.stdout else {}
-    except Exception as e:
-        log.warning(f"curl error: {e}")
-        return {}
-
-def tg_send(text: str):
-    _curl("sendMessage", data={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"})
-
-def tg_typing():
-    _curl("sendChatAction", data={"chat_id": CHAT_ID, "action": "typing"})
-
-def tg_get_updates(offset: int, timeout: int = 25):
-    cmd = ["curl", "-s", "--max-time", str(timeout+5),
-           f"{TG_API}/getUpdates?offset={offset}&timeout={timeout}&allowed_updates=[\"message\"]"]
-    for attempt in range(3):
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout+10)
-            d = json.loads(r.stdout)
-            if d.get("ok"):
-                return d.get("result", [])
-        except Exception as e:
-            log.warning(f"getUpdates attempt {attempt+1}: {e}")
-            time.sleep(2)
-    return []
-
-# ── Voice transcription ───────────────────────────────────────────────────────
-def transcribe_voice(file_id: str):
-    global _key_idx
-    try:
-        info = _curl("getFile", data={"file_id": file_id})
-        file_path = info.get("result", {}).get("file_path", "")
-        if not file_path:
-            return None
-        url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-        tmp = tempfile.mktemp(suffix=".ogg")
-        subprocess.run(["curl", "-s", "-o", tmp, url], timeout=30)
-        client = OpenAI(api_key=OPENAI_KEYS[_key_idx], base_url="https://api.openai.com/v1")
-        with open(tmp, "rb") as f:
-            t = client.audio.transcriptions.create(model="whisper-1", file=f, response_format="text")
-        try: os.unlink(tmp)
-        except: pass
-        return str(t)
-    except Exception as e:
-        log.error(f"transcribe_voice: {e}")
-        return None
-
-# ── Google Calendar ───────────────────────────────────────────────────────────
-def get_gcal():
-    creds = service_account.Credentials.from_service_account_file(
-        str(SA_FILE), scopes=["https://www.googleapis.com/auth/calendar"])
-    return gcal_build("calendar", "v3", credentials=creds)
-
-def gcal_list_upcoming(days=60):
-    try:
-        svc = get_gcal()
-        now = datetime.now(timezone(timedelta(hours=8)))
-        res = svc.events().list(
+        svc = get_calendar_service()
+        now = datetime.now(SGT)
+        result = svc.events().list(
             calendarId=GCAL_ID,
             timeMin=now.isoformat(),
             timeMax=(now + timedelta(days=days)).isoformat(),
-            maxResults=100, singleEvents=True, orderBy="startTime"
+            maxResults=50,
+            singleEvents=True,
+            orderBy="startTime"
         ).execute()
-        events = res.get("items", [])
-        if events:
-            CALENDAR_CACHE.write_text(json.dumps(events, indent=2))
-        return events
+        return result.get("items", [])
     except Exception as e:
-        log.warning(f"gcal_list error: {e}")
-        try:    return json.loads(CALENDAR_CACHE.read_text())
-        except: return []
+        log.error(f"fetch_upcoming_events: {e}")
+        return []
 
-def gcal_create(summary, date, start_time=None, end_time=None, description="", location=""):
-    svc = get_gcal()
-    if start_time:
-        s_dt = f"{date}T{start_time}:00+08:00"
-        if end_time:
-            e_dt = f"{date}T{end_time}:00+08:00"
-        else:
-            from datetime import datetime as dt
-            e_dt = (dt.fromisoformat(s_dt) + timedelta(hours=1)).isoformat()
-        start = {"dateTime": s_dt, "timeZone": "Asia/Singapore"}
-        end   = {"dateTime": e_dt, "timeZone": "Asia/Singapore"}
-    else:
-        start = end = {"date": date}
-
-    body = {"summary": summary, "start": start, "end": end,
-            "reminders": {"useDefault": False, "overrides": [
-                {"method": "popup", "minutes": 30},
-                {"method": "popup", "minutes": 1440}]}}
-    if description: body["description"] = description
-    if location:    body["location"]    = location
-    return svc.events().insert(calendarId=GCAL_ID, body=body).execute()
-
-def load_calendar():
-    try:    return json.loads(CALENDAR_CACHE.read_text())
-    except: return []
-
-def fmt_calendar(events):
-    if not events: return "No upcoming events."
+def format_events(events: list) -> str:
+    if not events:
+        return "No upcoming events."
     lines = []
     for e in events:
         s = e.get("start", {})
         dt = s.get("dateTime", s.get("date", ""))
+        # Parse and reformat nicely
+        try:
+            if "T" in dt:
+                parsed = datetime.fromisoformat(dt)
+                dt_fmt = parsed.strftime("%a %d %b, %I:%M%p")
+            else:
+                parsed = datetime.strptime(dt, "%Y-%m-%d")
+                dt_fmt = parsed.strftime("%a %d %b (all day)")
+        except:
+            dt_fmt = dt
         loc = e.get("location", "")
-        lines.append(f"• {e.get('summary','')}{'  @ '+loc[:40] if loc else ''} — {dt}")
+        loc_str = f"  📍 {loc[:40]}" if loc else ""
+        lines.append(f"• {e.get('summary', '(no title)')} — {dt_fmt}{loc_str}")
     return "\n".join(lines)
 
-# ── GPT ───────────────────────────────────────────────────────────────────────
-SYSTEM = """You are Ajay Bulusu's personal executive assistant (Singapore, SGT=UTC+8). Today: {today}.
+def create_calendar_event(summary, date, start_time=None, end_time=None, description="", location="") -> str:
+    try:
+        svc = get_calendar_service()
+        if start_time:
+            s_dt = f"{date}T{start_time}:00+08:00"
+            if end_time:
+                e_dt = f"{date}T{end_time}:00+08:00"
+            else:
+                from datetime import datetime as dt_cls
+                e_dt = (dt_cls.fromisoformat(s_dt) + timedelta(hours=1)).isoformat()
+            start = {"dateTime": s_dt, "timeZone": "Asia/Singapore"}
+            end   = {"dateTime": e_dt, "timeZone": "Asia/Singapore"}
+        else:
+            start = end = {"date": date}
 
-For CALENDAR ADD requests respond with:
-<calendar>
-{{"summary":"...","date":"YYYY-MM-DD","start_time":"HH:MM","end_time":"HH:MM","location":"","description":""}}
-</calendar>
-Then add a brief confirmation.
+        body = {
+            "summary": summary,
+            "start": start,
+            "end": end,
+            "description": description,
+            "location": location,
+            "reminders": {
+                "useDefault": False,
+                "overrides": [
+                    {"method": "popup", "minutes": 30},
+                    {"method": "popup", "minutes": 1440}
+                ]
+            }
+        }
+        event = svc.events().insert(calendarId=GCAL_ID, body=body).execute()
+        return event.get("htmlLink", "")
+    except Exception as e:
+        log.error(f"create_calendar_event: {e}")
+        raise
 
-For all other questions answer directly and concisely.
-Use *bold* for emphasis, • for bullets. Flag urgent items with ⚠️.
+# ── Gmail helpers ──────────────────────────────────────────────────────────────
+def fetch_recent_emails(max_results: int = 15) -> list[dict]:
+    """Returns list of {from, subject, date, snippet, body_preview}"""
+    try:
+        svc = get_gmail_service()
+        msgs = svc.users().messages().list(
+            userId="me",
+            maxResults=max_results,
+            labelIds=["INBOX"],
+            q="is:unread OR newer_than:2d"
+        ).execute().get("messages", [])
+
+        emails = []
+        for m in msgs[:max_results]:
+            try:
+                full = svc.users().messages().get(
+                    userId="me", id=m["id"], format="metadata",
+                    metadataHeaders=["From", "Subject", "Date"]
+                ).execute()
+                headers = {h["name"]: h["value"] for h in full.get("payload", {}).get("headers", [])}
+                emails.append({
+                    "from":    headers.get("From", ""),
+                    "subject": headers.get("Subject", "(no subject)"),
+                    "date":    headers.get("Date", ""),
+                    "snippet": full.get("snippet", ""),
+                    "id":      m["id"]
+                })
+            except Exception as e:
+                log.warning(f"Email fetch partial error: {e}")
+        return emails
+    except Exception as e:
+        log.error(f"fetch_recent_emails: {e}")
+        return []
+
+def format_emails(emails: list) -> str:
+    if not emails:
+        return "No recent emails."
+    lines = []
+    for e in emails:
+        lines.append(f"• *{e['subject']}*\n  From: {e['from'][:50]}\n  {e['snippet'][:100]}")
+    return "\n\n".join(lines)
+
+# ── Claude AI ─────────────────────────────────────────────────────────────────
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+SYSTEM_PROMPT = """You are Ajay's personal executive assistant based in Singapore (SGT = UTC+8).
+Today is {today}.
+
+You have access to Ajay's Gmail and Google Calendar context below.
+
+CAPABILITIES:
+1. Answer questions about emails, calendar, schedule, reminders
+2. Add calendar events — when Ajay asks to schedule/add something, respond with a JSON block:
+   <calendar_add>
+   {{"summary": "...", "date": "YYYY-MM-DD", "start_time": "HH:MM", "end_time": "HH:MM", "location": "", "description": ""}}
+   </calendar_add>
+   Then confirm in plain text.
+3. Give reminders, briefings, and proactive suggestions
+
+STYLE: Concise, direct, executive-level. Use *bold* for key info, bullet points for lists.
+Flag urgent/overdue items with ⚠️. Keep responses under 300 words unless a full briefing is requested.
 
 === CALENDAR (next 14 days) ===
-{calendar}"""
+{calendar}
 
-def gpt(user: str, calendar_ctx: str) -> str:
-    global _key_idx
-    today = datetime.now(timezone(timedelta(hours=8))).strftime("%d %B %Y, %A")
-    system = SYSTEM.format(today=today, calendar=calendar_ctx)
-    for attempt in range(6):
-        try:
-            r = _ai().chat.completions.create(
-                model=OPENAI_MODEL,
-                messages=[{"role":"system","content":system},{"role":"user","content":user}],
-                max_tokens=900, temperature=0.2
-            )
-            return r.choices[0].message.content.strip()
-        except Exception as e:
-            err = str(e)
-            if "429" in err or "rate_limit" in err.lower():
-                other = 1 - _key_idx
-                log.warning(f"Key {_key_idx} rate-limited → switching to key {other}")
-                _key_idx = other
-                time.sleep(3)
-            elif "401" in err or "invalid" in err.lower():
-                _key_idx = 1 - _key_idx
-                time.sleep(2)
-            else:
-                log.error(f"gpt error: {e}")
-                return f"⚠️ AI error: {err[:120]}"
-    return "⚠️ Both OpenAI keys are rate-limited — please try again in a minute."
+=== RECENT EMAILS (last 2 days / unread) ===
+{emails}"""
 
-# ── Message handler ───────────────────────────────────────────────────────────
-def handle_message(text: str):
+def ask_claude(user_message: str, calendar_ctx: str, email_ctx: str) -> str:
+    today = datetime.now(SGT).strftime("%A, %d %B %Y")
+    system = SYSTEM_PROMPT.format(today=today, calendar=calendar_ctx, emails=email_ctx)
     try:
-        tg_typing()
-        tl = text.strip().lower()
-
-        if tl in ["/start", "/help", "help"]:
-            tg_send(HELP_TEXT)
-            return
-
-        # Always fetch fresh calendar
-        calendar = gcal_list_upcoming(days=14)
-        now_sgt  = datetime.now(timezone(timedelta(hours=8)))
-        cal_14   = []
-        for ev in calendar:
-            try:
-                s = ev.get("start", {})
-                dt_str = s.get("dateTime", s.get("date", ""))
-                dt = datetime.fromisoformat(dt_str)
-                if not dt.tzinfo:
-                    dt = dt.replace(tzinfo=timezone(timedelta(hours=8)))
-                if dt <= now_sgt + timedelta(days=14):
-                    cal_14.append(ev)
-            except:
-                cal_14.append(ev)
-
-        cal_ctx  = fmt_calendar(cal_14)
-        response = gpt(text.strip(), cal_ctx)
-
-        if "<calendar>" in response and "</calendar>" in response:
-            m = re.search(r"<calendar>(.*?)</calendar>", response, re.DOTALL)
-            reply = re.sub(r"<calendar>.*?</calendar>", "", response, flags=re.DOTALL).strip()
-            if m:
-                try:
-                    d = json.loads(m.group(1).strip())
-                    gcal_create(
-                        d.get("summary", text[:50]),
-                        d["date"],
-                        d.get("start_time"), d.get("end_time"),
-                        d.get("description",""), d.get("location","")
-                    )
-                    t_str = f" at {d['start_time']}" if d.get("start_time") else ""
-                    e_str = f"–{d['end_time']}" if d.get("end_time") else ""
-                    l_str = f"\n📍 {d['location']}" if d.get("location") else ""
-                    tg_send(f"✅ *Added to Google Calendar!*\n\n*{d.get('summary','')}*\n🗓 {d['date']}{t_str}{e_str}{l_str}\n\n_Event is live in your calendar._")
-                    return
-                except Exception as e:
-                    log.error(f"Calendar create error: {e}")
-                    tg_send(f"⚠️ Could not add to calendar: {str(e)[:120]}")
-                    return
-
-        tg_send(response)
-
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            system=system,
+            messages=[{"role": "user", "content": user_message}]
+        )
+        return response.content[0].text
     except Exception as e:
-        log.error(f"handle_message: {e}\n{traceback.format_exc()}")
-        tg_send(f"⚠️ Error: {str(e)[:100]}")
+        log.error(f"Claude API error: {e}")
+        return f"⚠️ AI error: {str(e)[:120]}"
 
-# ── Queue worker ──────────────────────────────────────────────────────────────
-def queue_worker():
-    while True:
-        try:
-            text = msg_queue.get(timeout=60)
-            if text is None: break
-            handle_message(text)
-            msg_queue.task_done()
-        except queue.Empty:
-            pass
-        except Exception as e:
-            log.error(f"Queue worker: {e}")
+# ── Core message processing ───────────────────────────────────────────────────
+async def process_message(text: str, app: Application) -> str:
+    """Fetch context, call Claude, handle calendar adds. Returns reply string."""
+    # Fetch fresh context in parallel
+    loop = asyncio.get_event_loop()
+    events_fut = loop.run_in_executor(None, fetch_upcoming_events, 14)
+    emails_fut = loop.run_in_executor(None, fetch_recent_emails, 15)
+    events, emails = await asyncio.gather(events_fut, emails_fut)
 
-# ── Help text ─────────────────────────────────────────────────────────────────
-HELP_TEXT = """🤖 *Your Executive Assistant*
+    cal_ctx   = format_events(events)
+    email_ctx = format_emails(emails)
 
-Ask me anything naturally:
+    response = ask_claude(text, cal_ctx, email_ctx)
 
-💳 *Payments & Bills*
-• "When is my next StarHub bill?"
-• "Did my Sobha installment go through?"
-• "Any failed payments?"
+    # Handle calendar add if Claude returned one
+    if "<calendar_add>" in response and "</calendar_add>" in response:
+        match = re.search(r"<calendar_add>(.*?)</calendar_add>", response, re.DOTALL)
+        clean_reply = re.sub(r"<calendar_add>.*?</calendar_add>", "", response, flags=re.DOTALL).strip()
+        if match:
+            try:
+                d = json.loads(match.group(1).strip())
+                await loop.run_in_executor(None, lambda: create_calendar_event(
+                    d.get("summary", "New Event"),
+                    d["date"],
+                    d.get("start_time"),
+                    d.get("end_time"),
+                    d.get("description", ""),
+                    d.get("location", "")
+                ))
+                t_str = f" at {d['start_time']}" if d.get("start_time") else ""
+                e_str = f"–{d['end_time']}" if d.get("end_time") else ""
+                l_str = f"\n📍 {d['location']}" if d.get("location") else ""
+                return (
+                    f"✅ *Added to Google Calendar*\n\n"
+                    f"*{d.get('summary', '')}*\n"
+                    f"🗓 {d['date']}{t_str}{e_str}{l_str}\n\n"
+                    f"{clean_reply}"
+                ).strip()
+            except Exception as e:
+                log.error(f"Calendar create failed: {e}")
+                return f"⚠️ Couldn't add to calendar: {str(e)[:100]}\n\n{clean_reply}"
 
-✈️ *Travel*
-• "What are my upcoming flights?"
+    return response
 
-📊 *Investments*
-• "Any new IBKR alerts?"
+# ── Daily briefing ────────────────────────────────────────────────────────────
+async def send_daily_briefing(app: Application):
+    log.info("Sending daily briefing...")
+    try:
+        briefing_prompt = (
+            "Give me my morning briefing. Include: "
+            "1) Today's calendar events with times, "
+            "2) Any important/unread emails that need attention, "
+            "3) Key reminders or anything I might be forgetting. "
+            "Be concise but complete."
+        )
+        reply = await process_message(briefing_prompt, app)
+        header = f"☀️ *Good morning! Daily Briefing — {datetime.now(SGT).strftime('%A %d %B')}*\n\n"
+        await app.bot.send_message(
+            chat_id=CHAT_ID,
+            text=header + reply,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        log.error(f"Daily briefing error: {e}")
+        await app.bot.send_message(chat_id=CHAT_ID, text=f"⚠️ Briefing failed: {e}")
 
-📅 *Calendar*
-• "Add pickleball Monday 4–5pm"
-• "Schedule dentist Friday 3pm"
-• "What's on my calendar this week?"
+# ── Telegram handlers ─────────────────────────────────────────────────────────
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != CHAT_ID:
+        return
 
-🎙️ *Voice Notes*
-Just send a voice message — I'll transcribe and answer!
+    text = update.message.text.strip()
+    log.info(f"MSG: {text[:80]}")
 
-*Commands:*
-/help — This message"""
+    await update.message.chat.send_action(ChatAction.TYPING)
+    reply = await process_message(text, context.application)
+    await update.message.reply_text(reply, parse_mode="Markdown")
 
-# ── Minimal HTTP health-check (Railway requires a bound port) ─────────────────
-class HealthHandler(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"status":"ok"}')
-
-def start_health_server():
-    port = int(os.environ.get("PORT", 8080))
-    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-def run():
-    state  = load_state()
-    offset = state.get("last_update_id", 0) + 1
-    cal    = load_calendar()
-    log.info(f"Bot v5 starting. Calendar events: {len(cal)}, Offset: {offset}")
-
-    threading.Thread(target=queue_worker, daemon=True).start()
-    threading.Thread(target=start_health_server, daemon=True).start()
-
-    tg_send(
-        f"🤖 *Executive Assistant v5 is online!*\n\n"
-        f"✅ {len(cal)} calendar events loaded\n"
-        f"✅ Direct OpenAI (dual-key failover)\n"
-        f"✅ 24/7 on Railway cloud\n"
-        f"✅ Daily 8am briefing via Manus\n\n"
-        f"Ask me anything or type /help"
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != CHAT_ID:
+        return
+    await update.message.reply_text(
+        "🤖 *Personal Assistant is online!*\n\n"
+        "I can help with:\n"
+        "• 📅 Calendar — 'What's on this week?' / 'Add dentist Friday 3pm'\n"
+        "• 📧 Email — 'Any urgent emails?' / 'What did X send me?'\n"
+        "• ☀️ Briefing — 'Give me my morning briefing'\n"
+        "• 🔔 Reminders — just ask naturally\n\n"
+        "Talk to me like you would a human assistant.",
+        parse_mode="Markdown"
     )
 
-    touch_heartbeat()
-    consecutive_errors = 0
+# ── App startup ───────────────────────────────────────────────────────────────
+def main():
+    log.info("Starting bot...")
 
-    while True:
-        try:
-            updates = tg_get_updates(offset)
-            touch_heartbeat()
-            consecutive_errors = 0
+    app = Application.builder().token(BOT_TOKEN).build()
 
-            for upd in updates:
-                uid     = upd["update_id"]
-                offset  = uid + 1
-                state["last_update_id"] = uid
-                save_state(state)
+    app.add_handler(CommandHandler("start", handle_start))
+    app.add_handler(CommandHandler("help",  handle_start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-                msg     = upd.get("message", {})
-                chat_id = str(msg.get("chat", {}).get("id", ""))
-                text    = msg.get("text", "").strip()
+    # Schedule daily briefing at 8:00 AM SGT
+    scheduler = AsyncIOScheduler(timezone="Asia/Singapore")
+    scheduler.add_job(
+        send_daily_briefing,
+        trigger="cron",
+        hour=8, minute=0,
+        args=[app],
+        id="daily_briefing"
+    )
+    scheduler.start()
+    log.info("Scheduler started — daily briefing at 08:00 SGT")
 
-                if chat_id != CHAT_ID:
-                    continue
-
-                voice = msg.get("voice") or msg.get("audio")
-                if voice and not text:
-                    fid = voice.get("file_id")
-                    log.info(f"VOICE [{uid}]: {fid}")
-                    def _do(fid=fid, uid=uid):
-                        tg_send("🎙️ _Transcribing your voice note..._")
-                        t = transcribe_voice(fid)
-                        if t:
-                            log.info(f"VOICE [{uid}]: {t[:80]}")
-                            tg_send(f"🎙️ *You said:* _{t}_")
-                            msg_queue.put(t)
-                        else:
-                            tg_send("⚠️ Could not transcribe — please try again or type your question.")
-                    threading.Thread(target=_do, daemon=True).start()
-                    continue
-
-                if not text:
-                    continue
-
-                log.info(f"MSG [{uid}]: {text[:80]}")
-                msg_queue.put(text)
-
-        except KeyboardInterrupt:
-            log.info("Bot stopped.")
-            msg_queue.put(None)
-            break
-        except Exception as e:
-            consecutive_errors += 1
-            log.error(f"Poll error #{consecutive_errors}: {e}")
-            time.sleep(min(60, 5 * consecutive_errors))
+    log.info("Bot polling...")
+    app.run_polling(allowed_updates=["message"], drop_pending_updates=True)
 
 if __name__ == "__main__":
-    run()
+    main()

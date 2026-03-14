@@ -1,7 +1,6 @@
 [build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
+builder = "dockerfile"
 
 [deploy]
-restartPolicyType = "ON_FAILURE"
+restartPolicyType = "always"
 restartPolicyMaxRetries = 10
