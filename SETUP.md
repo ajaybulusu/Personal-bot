@@ -3,7 +3,7 @@
 ## What's in this bot
 - Reads Gmail (recent + unread emails)
 - Reads & writes Google Calendar
-- Answers questions via Claude AI
+- Answers questions via Claude AI (with OpenAI GPT fallback)
 - Daily 8:00 AM SGT briefing
 - Runs 24/7 on Railway
 
@@ -19,11 +19,17 @@
 
 ---
 
-## Step 2 — Get your Anthropic API Key
+## Step 2 — Get your API Keys
 
+### Anthropic (primary)
 1. Go to https://console.anthropic.com
 2. API Keys → Create Key
 3. Copy it — this is your **ANTHROPIC_API_KEY**
+
+### OpenAI (fallback)
+1. Go to https://platform.openai.com/api-keys
+2. Create Key
+3. Copy it — this is your **OPENAI_API_KEY**
 
 ---
 
@@ -76,6 +82,7 @@
    | `BOT_TOKEN` | Your Telegram bot token |
    | `CHAT_ID` | Your Telegram chat ID (number) |
    | `ANTHROPIC_API_KEY` | Your Anthropic API key |
+   | `OPENAI_API_KEY` | Your OpenAI API key (fallback) |
    | `SERVICE_ACCOUNT_JSON` | The full contents of your service account JSON |
    | `GCAL_ID` | Your calendar email (e.g. `yourname@gmail.com`) or `primary` |
 
