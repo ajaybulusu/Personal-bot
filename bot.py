@@ -1,17 +1,19 @@
 """
-Personal Assistant Telegram Bot — v6 (Railway, fixed)
-======================================================
+Personal Assistant Telegram Bot — v7 (Railway, Gmail OAuth)
+============================================================
 - python-telegram-bot async
-- OpenAI GPT-4o-mini (dual key failover, no Anthropic needed)
-- Google Calendar via service account (works)
-- Gmail gracefully skipped (personal Gmail needs OAuth — handled by Manus 8am briefing)
+- OpenAI GPT-4o-mini (dual key failover)
+- Google Calendar via service account
+- Gmail via OAuth2 refresh token (reads real emails)
 - APScheduler for daily 8am SGT briefing
 - All secrets from Railway environment variables
 """
 
-import os, re, json, logging, asyncio
+import os, re, json, logging, asyncio, base64
 from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 
+import requests
 import openai
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
@@ -30,9 +32,12 @@ log = logging.getLogger("bot")
 # ── Config from environment ───────────────────────────────────────────────────
 BOT_TOKEN  = os.environ["BOT_TOKEN"]
 CHAT_ID    = os.environ["CHAT_ID"]
-SA_JSON    = os.environ.get("SERVICE_ACCOUNT_JSON", "")
-GCAL_ID    = os.environ.get("GCAL_ID", "primary")
-SGT        = timezone(timedelta(hours=8))
+SA_JSON           = os.environ.get("SERVICE_ACCOUNT_JSON", "")
+GCAL_ID           = os.environ.get("GCAL_ID", "primary")
+GMAIL_CLIENT_ID   = os.environ.get("GMAIL_CLIENT_ID", "")
+GMAIL_CLIENT_SEC  = os.environ.get("GMAIL_CLIENT_SECRET", "")
+GMAIL_REFRESH_TOK = os.environ.get("GMAIL_REFRESH_TOKEN", "")
+SGT               = timezone(timedelta(hours=8))
 
 # Dual OpenAI key support
 OPENAI_KEYS = [k for k in [
@@ -47,6 +52,84 @@ _key_idx = 0
 
 def get_openai_client():
     return openai.OpenAI(api_key=OPENAI_KEYS[_key_idx])
+
+# ── Gmail OAuth ──────────────────────────────────────────────────────────────
+def get_gmail_access_token() -> str:
+    """Exchange refresh token for a fresh access token."""
+    if not all([GMAIL_CLIENT_ID, GMAIL_CLIENT_SEC, GMAIL_REFRESH_TOK]):
+        return ""
+    r = requests.post("https://oauth2.googleapis.com/token", data={
+        "client_id":     GMAIL_CLIENT_ID,
+        "client_secret": GMAIL_CLIENT_SEC,
+        "refresh_token": GMAIL_REFRESH_TOK,
+        "grant_type":    "refresh_token"
+    }, timeout=10)
+    return r.json().get("access_token", "")
+
+def fetch_emails(query: str = "", max_results: int = 20) -> list:
+    """Fetch emails matching query. Returns list of {subject, from, date, snippet}."""
+    try:
+        token = get_gmail_access_token()
+        if not token:
+            return []
+        headers = {"Authorization": f"Bearer {token}"}
+        params = {"maxResults": max_results, "q": query}
+        r = requests.get("https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                         headers=headers, params=params, timeout=10)
+        msg_ids = [m["id"] for m in r.json().get("messages", [])]
+        emails = []
+        for mid in msg_ids[:max_results]:
+            mr = requests.get(f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date",
+                              headers=headers, timeout=10)
+            payload = mr.json()
+            hdrs = {h["name"]: h["value"] for h in payload.get("payload", {}).get("headers", [])}
+            emails.append({
+                "subject": hdrs.get("Subject", ""),
+                "from":    hdrs.get("From", ""),
+                "date":    hdrs.get("Date", ""),
+                "snippet": payload.get("snippet", "")
+            })
+        return emails
+    except Exception as e:
+        log.error(f"fetch_emails error: {e}")
+        return []
+
+def get_email_context(user_query: str) -> str:
+    """Fetch relevant emails based on query keywords and format for AI context."""
+    # Build a targeted Gmail search query from the user's message
+    keywords = []
+    q_lower = user_query.lower()
+    if any(w in q_lower for w in ["starhub", "bill", "payment", "due", "invoice"]):
+        keywords.append("starhub OR invoice OR payment due")
+    if any(w in q_lower for w in ["sobha", "property", "rent", "mortgage"]):
+        keywords.append("sobha OR property OR rent")
+    if any(w in q_lower for w in ["insurance", "aia", "prudential", "great eastern"]):
+        keywords.append("insurance OR AIA OR prudential")
+    if any(w in q_lower for w in ["ibkr", "interactive brokers", "investment", "stock"]):
+        keywords.append("IBKR OR interactive brokers OR investment")
+    if any(w in q_lower for w in ["flight", "travel", "booking", "hotel", "airbnb"]):
+        keywords.append("flight OR booking confirmation OR hotel")
+    if any(w in q_lower for w in ["dbs", "bank", "transfer", "transaction"]):
+        keywords.append("DBS OR bank statement OR transaction")
+    if any(w in q_lower for w in ["email", "gmail", "message", "briefing"]):
+        keywords.append("")
+
+    if not keywords:
+        return ""  # No email context needed for this query
+
+    query = " OR ".join(keywords)
+    emails = fetch_emails(query=query, max_results=10)
+    if not emails:
+        return ""
+
+    lines = ["=== RELEVANT EMAILS ==="]
+    for e in emails:
+        lines.append(f"From: {e['from'][:50]}")
+        lines.append(f"Subject: {e['subject'][:80]}")
+        lines.append(f"Date: {e['date'][:30]}")
+        lines.append(f"Preview: {e['snippet'][:150]}")
+        lines.append("---")
+    return "\n".join(lines)
 
 # ── Google Calendar ───────────────────────────────────────────────────────────
 def get_calendar_service():
@@ -180,7 +263,12 @@ async def process_message(text: str) -> str:
     loop = asyncio.get_event_loop()
     events = await loop.run_in_executor(None, fetch_upcoming_events, 14)
     cal_ctx = format_events(events)
-    response = ask_ai(text, cal_ctx)
+    # Fetch relevant emails in parallel
+    email_ctx = await loop.run_in_executor(None, get_email_context, text)
+    full_ctx = cal_ctx
+    if email_ctx:
+        full_ctx = cal_ctx + "\n\n" + email_ctx
+    response = ask_ai(text, full_ctx)
 
     if "<calendar_add>" in response and "</calendar_add>" in response:
         match = re.search(r"<calendar_add>(.*?)</calendar_add>", response, re.DOTALL)
@@ -306,6 +394,7 @@ def main():
     log.info(f"OpenAI keys configured: {len(OPENAI_KEYS)}")
     log.info(f"Service account: {'set' if SA_JSON else 'MISSING'}")
     log.info(f"Calendar ID: {GCAL_ID}")
+    log.info(f"Gmail OAuth: {'configured' if GMAIL_REFRESH_TOK else 'NOT SET — email queries will not work'}")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
