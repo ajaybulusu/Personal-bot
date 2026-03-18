@@ -318,6 +318,43 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.error(f"handle_voice error: {e}")
         await update.message.reply_text(f"Voice error: {str(e)[:150]}")
 
+
+async def handle_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if str(update.effective_chat.id) != CHAT_ID:
+        return
+    lines = [
+        f"BOT_TOKEN: set",
+        f"CHAT_ID: {CHAT_ID}",
+        f"GCAL_ID: {GCAL_ID}",
+        f"SERVICE_ACCOUNT: {'set (' + str(len(SA_JSON)) + ' chars)' if SA_JSON else 'MISSING'}",
+        f"GMAIL_CLIENT_ID: {'set' if GMAIL_CLIENT_ID else 'MISSING'}",
+        f"GMAIL_CLIENT_SECRET: {'set' if GMAIL_CLIENT_SEC else 'MISSING'}",
+        f"GMAIL_REFRESH_TOKEN: {'set (' + str(len(GMAIL_REFRESH_TOK)) + ' chars)' if GMAIL_REFRESH_TOK else 'MISSING'}",
+        f"OPENAI_KEYS: {len(OPENAI_KEYS)} loaded",
+        "",
+    ]
+    token = get_gmail_token()
+    if token:
+        try:
+            r = requests.get(
+                "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"maxResults": 1, "q": "is:inbox"},
+                timeout=10
+            )
+            msgs = r.json().get("messages", [])
+            lines.append(f"Gmail: OK - {len(msgs)} msg(s) found")
+        except Exception as e:
+            lines.append(f"Gmail: ERROR - {str(e)[:80]}")
+    else:
+        lines.append("Gmail: FAILED to get token")
+    cal = get_calendar_events(7)
+    if "unavailable" in cal.lower() or "error" in cal.lower():
+        lines.append(f"Calendar: ERROR - {cal[:80]}")
+    else:
+        lines.append(f"Calendar: OK - {cal[:120]}")
+    await update.message.reply_text("\n".join(lines))
+
 async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != CHAT_ID:
         return
@@ -356,6 +393,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("help",  handle_start))
+    app.add_handler(CommandHandler("debug", handle_debug))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
