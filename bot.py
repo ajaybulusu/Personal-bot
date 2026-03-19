@@ -1,15 +1,17 @@
 """
-Personal Assistant Telegram Bot — v8
-- Always replies, never silently fails
+Personal Assistant Telegram Bot — v9
+- Conversation memory (last 10 exchanges)
 - Google Calendar via service account (shared calendar)
 - Gmail via OAuth2 refresh token
 - OpenAI GPT-4o-mini with dual key failover
 - Voice transcription via Whisper
 - Daily 8am SGT briefing
+- /debug command to verify env vars
 """
 
-import os, re, json, logging, asyncio
+import os, re, json, logging, asyncio, tempfile
 from datetime import datetime, timezone, timedelta
+from collections import deque
 
 import requests
 import openai
@@ -29,16 +31,30 @@ GCAL_ID           = os.environ.get("GCAL_ID", "primary")
 GMAIL_CLIENT_ID   = os.environ.get("GMAIL_CLIENT_ID", "")
 GMAIL_CLIENT_SEC  = os.environ.get("GMAIL_CLIENT_SECRET", "")
 GMAIL_REFRESH_TOK = os.environ.get("GMAIL_REFRESH_TOKEN", "")
-OPENAI_KEYS       = [k for k in [
+OPENAI_KEYS       = [k.strip() for k in [
     os.environ.get("OPENAI_KEY_PRIMARY", ""),
     os.environ.get("OPENAI_KEY_BACKUP", ""),
-] if k]
+] if k.strip()]
 SGT = timezone(timedelta(hours=8))
 
 if not OPENAI_KEYS:
     raise RuntimeError("Set OPENAI_KEY_PRIMARY in Railway env vars")
 
 _key_idx = 0
+
+# ── Conversation memory ───────────────────────────────────────────────────────
+# Stores last 10 exchanges per chat_id
+_conv: dict = {}
+MAX_TURNS = 10
+
+def get_history(chat_id: str) -> list:
+    return list(_conv.get(chat_id, []))
+
+def save_turn(chat_id: str, user_text: str, assistant_text: str):
+    if chat_id not in _conv:
+        _conv[chat_id] = deque(maxlen=MAX_TURNS * 2)
+    _conv[chat_id].append({"role": "user", "content": user_text})
+    _conv[chat_id].append({"role": "assistant", "content": assistant_text})
 
 # ── OpenAI ────────────────────────────────────────────────────────────────────
 def ask_openai(messages: list) -> str:
@@ -65,6 +81,8 @@ def ask_openai(messages: list) -> str:
 
 # ── Google Calendar ───────────────────────────────────────────────────────────
 def get_calendar_events(days: int = 14) -> str:
+    if not SA_JSON:
+        return "Calendar unavailable: SERVICE_ACCOUNT_JSON not set."
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build as gbuild
@@ -78,33 +96,30 @@ def get_calendar_events(days: int = 14) -> str:
             calendarId=GCAL_ID,
             timeMin=now.isoformat(),
             timeMax=(now + timedelta(days=days)).isoformat(),
-            maxResults=50, singleEvents=True, orderBy="startTime"
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=20
         ).execute()
         events = result.get("items", [])
         if not events:
-            return "No upcoming events in the next 14 days."
+            return f"No upcoming events in the next {days} days."
         lines = []
         for e in events:
-            s = e.get("start", {})
-            dt = s.get("dateTime", s.get("date", ""))
+            start = e["start"].get("dateTime", e["start"].get("date", ""))
             try:
-                if "T" in dt:
-                    parsed = datetime.fromisoformat(dt)
-                    dt_fmt = parsed.strftime("%a %d %b %I:%M%p")
-                else:
-                    parsed = datetime.strptime(dt, "%Y-%m-%d")
-                    dt_fmt = parsed.strftime("%a %d %b (all day)")
-            except:
-                dt_fmt = dt
-            loc = e.get("location", "")
-            loc_str = f" @ {loc[:40]}" if loc else ""
-            lines.append(f"• {e.get('summary','(no title)')} — {dt_fmt}{loc_str}")
+                dt = datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(SGT)
+                start_str = dt.strftime("%a %d %b %Y %H:%M SGT")
+            except Exception:
+                start_str = start
+            lines.append(f"- {e.get('summary','(no title)')} | {start_str}")
         return "\n".join(lines)
     except Exception as e:
         log.error(f"Calendar error: {e}")
-        return f"[Calendar unavailable: {str(e)[:80]}]"
+        return f"Calendar error: {str(e)[:150]}"
 
 def add_calendar_event(summary, date, start_time=None, end_time=None, location="", description="") -> str:
+    if not SA_JSON:
+        return "Calendar unavailable."
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build as gbuild
@@ -114,26 +129,19 @@ def add_calendar_event(summary, date, start_time=None, end_time=None, location="
         )
         svc = gbuild("calendar", "v3", credentials=creds)
         if start_time:
-            s_dt = f"{date}T{start_time}:00+08:00"
-            e_dt = f"{date}T{end_time}:00+08:00" if end_time else \
-                   (datetime.fromisoformat(s_dt) + timedelta(hours=1)).isoformat()
-            start = {"dateTime": s_dt, "timeZone": "Asia/Singapore"}
-            end   = {"dateTime": e_dt, "timeZone": "Asia/Singapore"}
+            start = {"dateTime": f"{date}T{start_time}:00+08:00", "timeZone": "Asia/Singapore"}
+            end_t = end_time or (datetime.strptime(start_time, "%H:%M") + timedelta(hours=1)).strftime("%H:%M")
+            end = {"dateTime": f"{date}T{end_t}:00+08:00", "timeZone": "Asia/Singapore"}
         else:
-            start = end = {"date": date}
-        body = {
-            "summary": summary, "start": start, "end": end,
-            "location": location, "description": description,
-            "reminders": {"useDefault": False, "overrides": [
-                {"method": "popup", "minutes": 30},
-                {"method": "popup", "minutes": 1440}
-            ]}
-        }
-        event = svc.events().insert(calendarId=GCAL_ID, body=body).execute()
-        return event.get("htmlLink", "added")
+            start = {"date": date}
+            end = {"date": date}
+        event = {"summary": summary, "location": location, "description": description,
+                 "start": start, "end": end}
+        created = svc.events().insert(calendarId=GCAL_ID, body=event).execute()
+        return created.get("htmlLink", "Event created")
     except Exception as e:
         log.error(f"Calendar add error: {e}")
-        return f"error: {str(e)[:80]}"
+        return f"Failed to add event: {str(e)[:100]}"
 
 # ── Gmail ─────────────────────────────────────────────────────────────────────
 def get_gmail_token() -> str:
@@ -151,65 +159,69 @@ def get_gmail_token() -> str:
         log.error(f"Gmail token error: {e}")
         return ""
 
-def search_gmail(query: str, max_results: int = 15) -> str:
+def search_gmail(query: str, max_results: int = 10) -> str:
     token = get_gmail_token()
     if not token:
-        return "[Gmail not configured]"
+        return "Gmail unavailable: OAuth token missing or failed."
     try:
         headers = {"Authorization": f"Bearer {token}"}
         r = requests.get(
             "https://gmail.googleapis.com/gmail/v1/users/me/messages",
-            headers=headers, params={"maxResults": max_results, "q": query}, timeout=10
+            headers=headers,
+            params={"maxResults": max_results, "q": query},
+            timeout=10
         )
-        msg_ids = [m["id"] for m in r.json().get("messages", [])]
-        if not msg_ids:
+        msgs = r.json().get("messages", [])
+        if not msgs:
             return f"No emails found for: {query}"
-        lines = []
-        for mid in msg_ids[:max_results]:
+        results = []
+        for m in msgs[:8]:
             mr = requests.get(
-                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{mid}"
-                "?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date",
+                f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{m['id']}?format=metadata"
+                "&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date",
                 headers=headers, timeout=10
             )
             p = mr.json()
             hdrs = {h["name"]: h["value"] for h in p.get("payload", {}).get("headers", [])}
-            lines.append(
-                f"From: {hdrs.get('From','')[:50]}\n"
-                f"Subject: {hdrs.get('Subject','')[:80]}\n"
-                f"Date: {hdrs.get('Date','')[:30]}\n"
-                f"Preview: {p.get('snippet','')[:150]}\n---"
+            snippet = p.get("snippet", "")[:200]
+            results.append(
+                f"From: {hdrs.get('From','?')}\n"
+                f"Subject: {hdrs.get('Subject','?')}\n"
+                f"Date: {hdrs.get('Date','?')}\n"
+                f"Preview: {snippet}\n"
             )
-        return "\n".join(lines)
+        return "\n---\n".join(results)
     except Exception as e:
         log.error(f"Gmail search error: {e}")
-        return f"[Gmail search failed: {str(e)[:80]}]"
+        return f"Gmail error: {str(e)[:100]}"
 
-def get_email_context(query: str) -> str:
-    q = query.lower()
-    gmail_query = ""
-    if any(w in q for w in ["starhub", "bill", "invoice", "payment due", "amount due"]):
-        gmail_query = "starhub OR invoice OR bill"
-    elif any(w in q for w in ["sobha", "property", "rent", "mortgage"]):
-        gmail_query = "sobha OR property rent"
-    elif any(w in q for w in ["insurance", "aia", "prudential", "great eastern", "policy"]):
-        gmail_query = "insurance premium OR policy renewal"
+def get_email_context(question: str) -> str:
+    q = question.lower()
+    gmail_query = None
+    if any(w in q for w in ["starhub", "star hub", "telco", "mobile bill", "broadband"]):
+        gmail_query = "StarHub bill OR invoice OR payment"
+    elif any(w in q for w in ["sobha", "property", "condo", "maintenance"]):
+        gmail_query = "Sobha OR property maintenance"
+    elif any(w in q for w in ["insurance", "aia", "prudential", "great eastern", "income"]):
+        gmail_query = "insurance premium OR policy"
     elif any(w in q for w in ["ibkr", "interactive brokers", "stock", "portfolio"]):
         gmail_query = "IBKR OR interactive brokers"
     elif any(w in q for w in ["flight", "booking", "hotel", "travel", "airbnb"]):
         gmail_query = "booking confirmation OR flight OR hotel"
-    elif any(w in q for w in ["dbs", "bank", "transaction", "transfer"]):
-        gmail_query = "DBS bank OR transaction"
+    elif any(w in q for w in ["dbs", "bank", "transaction", "transfer", "payment"]):
+        gmail_query = "DBS bank OR transaction OR payment"
+    elif any(w in q for w in ["bill", "invoice", "due", "overdue", "amount"]):
+        gmail_query = "bill OR invoice OR payment due"
     elif any(w in q for w in ["email", "mail", "message", "inbox"]):
-        gmail_query = ""  # fetch recent
-    
-    if gmail_query is not None and (gmail_query or any(w in q for w in ["email", "mail", "inbox"])):
-        return search_gmail(gmail_query or "is:unread", max_results=10)
+        gmail_query = "is:unread"
+    if gmail_query is not None:
+        return search_gmail(gmail_query, max_results=10)
     return ""
 
 # ── Main AI handler ───────────────────────────────────────────────────────────
-async def process_message(text: str) -> str:
+async def process_message(text: str, chat_id: str) -> str:
     today = datetime.now(SGT).strftime("%A, %d %B %Y %H:%M SGT")
-    
+
     # Fetch calendar and email context in parallel
     loop = asyncio.get_event_loop()
     cal_task   = loop.run_in_executor(None, get_calendar_events, 14)
@@ -224,18 +236,19 @@ async def process_message(text: str) -> str:
 Today is {today}.
 
 You have access to Ajay's real Google Calendar and Gmail data below.
-Answer questions directly using this data. Be concise and executive-level.
-For bills/payments, extract the amount and due date from the email previews.
+Answer questions directly and concisely using this data.
+For bills/payments, extract the exact amount and due date from the email previews.
 For calendar, list events with times clearly.
 Do NOT say you cannot access data — the data is provided below.
-Use plain text only (no markdown asterisks).
+Use plain text only (no markdown asterisks or bullet symbols).
+Remember the conversation context and refer back to it when relevant.
 
 {chr(10).join(context_parts)}"""
 
     # Check if this is a calendar add request
     add_keywords = ["add", "schedule", "book", "create", "set up", "remind me", "put"]
     cal_keywords = ["meeting", "appointment", "event", "call", "dinner", "lunch", "gym",
-                    "flight", "dentist", "doctor", "birthday", "catch-up", "catchup"]
+                    "flight", "dentist", "doctor", "birthday", "catch-up", "catchup", "session"]
     is_add = any(w in text.lower() for w in add_keywords) and \
              any(w in text.lower() for w in cal_keywords)
 
@@ -248,14 +261,16 @@ When adding a calendar event, respond ONLY with this JSON block followed by a co
 </calendar_add>
 Then write a brief confirmation line."""
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": text}
-    ]
+    # Build messages with conversation history for context
+    history = get_history(chat_id)
+    messages = [{"role": "system", "content": system}] + history + [{"role": "user", "content": text}]
 
     response = await loop.run_in_executor(None, ask_openai, messages)
 
-    # Handle calendar add
+    # Save this exchange to conversation memory
+    save_turn(chat_id, text, response)
+
+    # Handle calendar add response
     if "<calendar_add>" in response and "</calendar_add>" in response:
         match = re.search(r"<calendar_add>(.*?)</calendar_add>", response, re.DOTALL)
         clean = re.sub(r"<calendar_add>.*?</calendar_add>", "", response, flags=re.DOTALL).strip()
@@ -280,10 +295,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != CHAT_ID:
         return
     text = update.message.text.strip()
+    chat_id = str(update.effective_chat.id)
     log.info(f"MSG: {text[:80]}")
     await update.message.chat.send_action(ChatAction.TYPING)
     try:
-        reply = await process_message(text)
+        reply = await process_message(text, chat_id)
         await update.message.reply_text(reply[:4096])
     except Exception as e:
         log.error(f"handle_text error: {e}")
@@ -292,32 +308,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != CHAT_ID:
         return
-    voice = update.message.voice or update.message.audio
-    if not voice:
-        return
-    await update.message.chat.send_action(ChatAction.TYPING)
+    chat_id = str(update.effective_chat.id)
+    await update.message.reply_text("Transcribing your voice note...")
     try:
-        await update.message.reply_text("Transcribing voice note...")
+        voice = update.message.voice or update.message.audio
         file = await context.bot.get_file(voice.file_id)
-        import tempfile
-        tmp = tempfile.mktemp(suffix=".ogg")
-        await file.download_to_drive(tmp)
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            await file.download_to_drive(tmp.name)
+            tmp_path = tmp.name
         client = openai.OpenAI(api_key=OPENAI_KEYS[_key_idx])
-        with open(tmp, "rb") as f:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1", file=f, response_format="text"
-            )
-        try: os.unlink(tmp)
-        except: pass
-        text = str(transcript).strip()
-        log.info(f"VOICE: {text[:80]}")
-        await update.message.reply_text(f"You said: {text}")
-        reply = await process_message(text)
+        with open(tmp_path, "rb") as af:
+            transcription = client.audio.transcriptions.create(
+                model="whisper-1", file=af
+            ).text
+        os.unlink(tmp_path)
+        await update.message.reply_text(f"You said: {transcription}")
+        await update.message.chat.send_action(ChatAction.TYPING)
+        reply = await process_message(transcription, chat_id)
         await update.message.reply_text(reply[:4096])
     except Exception as e:
         log.error(f"handle_voice error: {e}")
-        await update.message.reply_text(f"Voice error: {str(e)[:150]}")
-
+        await update.message.reply_text(f"Voice error: {str(e)[:200]}")
 
 async def handle_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != CHAT_ID:
@@ -326,7 +337,7 @@ async def handle_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"BOT_TOKEN: set",
         f"CHAT_ID: {CHAT_ID}",
         f"GCAL_ID: {GCAL_ID}",
-        f"SERVICE_ACCOUNT: {'set (' + str(len(SA_JSON)) + ' chars)' if SA_JSON else 'MISSING'}",
+        f"SERVICE_ACCOUNT_JSON: {'set (' + str(len(SA_JSON)) + ' chars)' if SA_JSON else 'MISSING'}",
         f"GMAIL_CLIENT_ID: {'set' if GMAIL_CLIENT_ID else 'MISSING'}",
         f"GMAIL_CLIENT_SECRET: {'set' if GMAIL_CLIENT_SEC else 'MISSING'}",
         f"GMAIL_REFRESH_TOKEN: {'set (' + str(len(GMAIL_REFRESH_TOK)) + ' chars)' if GMAIL_REFRESH_TOK else 'MISSING'}",
@@ -343,7 +354,7 @@ async def handle_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 timeout=10
             )
             msgs = r.json().get("messages", [])
-            lines.append(f"Gmail: OK - {len(msgs)} msg(s) found")
+            lines.append(f"Gmail: OK - {len(msgs)} message(s) found")
         except Exception as e:
             lines.append(f"Gmail: ERROR - {str(e)[:80]}")
     else:
@@ -359,24 +370,40 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(update.effective_chat.id) != CHAT_ID:
         return
     await update.message.reply_text(
-        "Personal Assistant online.\n\n"
-        "Ask me anything:\n"
-        "- What's on my calendar this week?\n"
-        "- What's my StarHub bill amount?\n"
-        "- Add dentist Friday 3pm\n"
-        "- Any upcoming payments due?\n"
-        "- Morning briefing\n\n"
-        "Or send a voice note."
+        "Hello Ajay! Your executive assistant is online.\n\n"
+        "I can help with:\n"
+        "- Calendar: view events, add meetings\n"
+        "- Bills: StarHub, DBS, insurance, Sobha\n"
+        "- Emails: payments, bookings, alerts\n"
+        "- Voice notes: just hold the mic\n\n"
+        "Type /debug to check system status."
     )
 
-async def send_daily_briefing(app: Application):
-    log.info("Sending daily briefing...")
+# ── Daily briefing ────────────────────────────────────────────────────────────
+async def send_daily_briefing(app):
     try:
-        reply = await process_message(
-            "Give me my full morning briefing: today's calendar events with times, "
-            "any bills or payments due this week from emails, and what I should focus on today."
-        )
-        header = f"Good morning! Daily Briefing — {datetime.now(SGT).strftime('%A %d %B %Y')}\n\n"
+        log.info("Sending daily briefing...")
+        today = datetime.now(SGT).strftime("%A, %d %B %Y")
+        loop = asyncio.get_event_loop()
+        cal_ctx   = await loop.run_in_executor(None, get_calendar_events, 7)
+        email_ctx = await loop.run_in_executor(None, search_gmail,
+            "bill OR invoice OR payment OR statement OR booking", 15)
+
+        system = f"""You are Ajay's executive assistant. Today is {today} (SGT).
+Generate a concise morning briefing covering:
+1. Today's calendar events
+2. This week's upcoming events
+3. Any bills or payments due soon (from emails)
+4. Any important emails or alerts
+
+Use plain text. Be direct and executive-level. No markdown."""
+
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Calendar:\n{cal_ctx}\n\nEmails:\n{email_ctx}"}
+        ]
+        reply = await loop.run_in_executor(None, ask_openai, messages)
+        header = f"Good morning! Daily Briefing — {today}\n\n"
         await app.bot.send_message(chat_id=CHAT_ID, text=(header + reply)[:4096])
     except Exception as e:
         log.error(f"Briefing error: {e}")
@@ -384,7 +411,7 @@ async def send_daily_briefing(app: Application):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info("=== Bot v8 starting ===")
+    log.info("=== Bot v9 starting ===")
     log.info(f"OpenAI keys: {len(OPENAI_KEYS)}")
     log.info(f"Calendar ID: {GCAL_ID}")
     log.info(f"Gmail: {'configured' if GMAIL_REFRESH_TOK else 'NOT SET'}")
@@ -401,7 +428,6 @@ def main():
     scheduler.add_job(send_daily_briefing, "cron", hour=8, minute=0, args=[app])
     scheduler.start()
     log.info("Scheduler started — daily briefing at 08:00 SGT")
-
     log.info("Polling...")
     app.run_polling(allowed_updates=["message"], drop_pending_updates=False)
 
